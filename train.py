@@ -1,4 +1,4 @@
-"""Experimental low-memory trainer; network/checkpoint tensor shapes are unchanged."""
+"""Experimental low-memory trainer; opt-in initialized adapter fine-tuning."""
 import logging
 import multiprocessing
 import os
@@ -24,6 +24,8 @@ from modules.training_runtime import (
     cuda_autocast, frozen_parameters, make_grad_scaler, resolve_precision,
     seed_worker, unwrap_model,
 )
+from modules.training_setup import prepare_generator
+from modules.voice_adapter import optimizer_groups
 
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('numba').setLevel(logging.WARNING)
@@ -95,9 +97,14 @@ def run(rank, n_gpus, hps):
 
         net_g = SynthesizerTrn(hps.data.filter_length // 2 + 1,
                               hps.train.segment_size // hps.data.hop_length,
-                              **hps.model).cuda(rank)
+                              **hps.model)
+        # Initialize and select parameters BEFORE optimizer/DDP construction.
+        # Adapter modes refuse to freeze a randomly initialized backbone.
+        setup_report = prepare_generator(net_g, hps.train)
+        logger.info('Generator setup: %s', setup_report)
+        net_g = net_g.cuda(rank)
         net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
-        optim_g = torch.optim.AdamW(net_g.parameters(), hps.train.learning_rate,
+        optim_g = torch.optim.AdamW(optimizer_groups(net_g), hps.train.learning_rate,
                                     betas=hps.train.betas, eps=hps.train.eps)
         optim_d = torch.optim.AdamW(net_d.parameters(), hps.train.learning_rate,
                                     betas=hps.train.betas, eps=hps.train.eps)
@@ -111,6 +118,10 @@ def run(rank, n_gpus, hps):
         try:
             g_path = utils.latest_checkpoint_path(hps.model_dir, 'G_*.pth')
             d_path = utils.latest_checkpoint_path(hps.model_dir, 'D_*.pth')
+            # New architecture runs must never resume with silently missing tensors.
+            if unwrap_model(net_g).adapter_rank:
+                from modules.model_io import compatible_state, read_weights
+                compatible_state(unwrap_model(net_g), read_weights(g_path))
             _, _, _, epoch_str = utils.load_checkpoint(g_path, net_g, optim_g, False)
             _, _, _, epoch_str = utils.load_checkpoint(d_path, net_d, optim_d, False)
             epoch_str = max(epoch_str, 1)
