@@ -1,8 +1,9 @@
+"""K-means helpers; scikit-learn is required only when loading a cluster model."""
 import torch
-from sklearn.cluster import KMeans
 
 
 def get_cluster_model(ckpt_path):
+    from sklearn.cluster import KMeans
     checkpoint = torch.load(ckpt_path)
     kmeans_dict = {}
     for spk, ckpt in checkpoint.items():
@@ -13,17 +14,16 @@ def get_cluster_model(ckpt_path):
         kmeans_dict[spk] = km
     return kmeans_dict
 
+
 def get_cluster_result(model, x, speaker):
-    """
-        x: np.array [t, 256]
-        return cluster class result
-    """
+    """Return cluster labels for features shaped [frames, channels]."""
     return model[speaker].predict(x)
 
-def get_cluster_center_result(model, x,speaker):
-    """x: np.array [t, 256]"""
-    predict = model[speaker].predict(x)
-    return model[speaker].cluster_centers_[predict]
 
-def get_center(model, x,speaker):
+def get_cluster_center_result(model, x, speaker):
+    """Return the nearest center for each input feature frame."""
+    return model[speaker].cluster_centers_[get_cluster_result(model, x, speaker)]
+
+
+def get_center(model, x, speaker):
     return model[speaker].cluster_centers_[x]
