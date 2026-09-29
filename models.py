@@ -7,9 +7,10 @@ from torch.nn.utils import spectral_norm, weight_norm
 import modules.attentions as attentions
 import modules.commons as commons
 import modules.modules as modules
-import utils
+import modules.model_utils as utils
+from modules.voice_adapter import VoiceAdapter
 from modules.commons import get_padding
-from utils import f0_to_coarse
+from modules.model_utils import f0_to_coarse
 
 
 class ResidualCouplingBlock(nn.Module):
@@ -70,9 +71,6 @@ class TransformerCouplingBlock(nn.Module):
         self.hidden_channels = hidden_channels
         self.kernel_size = kernel_size
         self.n_layers = n_layers
-        self.n_flows = n_flows
-        self.gin_channels = gin_channels
-
         self.flows = nn.ModuleList()
 
         self.wn = attentions.FFT(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, isflow = True, gin_channels = self.gin_channels) if share_parameter else None
@@ -279,7 +277,7 @@ class SpeakerEncoder(torch.nn.Module):
 
         if mel_len > partial_frames:
             mel_slices = self.compute_partial_slices(mel_len, partial_frames, partial_hop)
-            mels = list(mel[:, s] for s in mel_slices)
+            mels = [mel[:, s] for s in mel_slices]
             mels.append(last_mel)
             mels = torch.stack(tuple(mels), 0).squeeze(1)
 
@@ -369,9 +367,22 @@ class SynthesizerTrn(nn.Module):
                  n_flow_layer = 4,
                  n_layers_trans_flow = 3,
                  use_transformer_flow = False,
+                 inference_only=False,
+                 posterior_layers=16,
+                 adapter_rank=0,
                  **kwargs):
 
         super().__init__()
+        # n_layers_q in legacy templates was ignored. Do not reinterpret it and
+        # silently change old checkpoint shapes. posterior_layers is the new field.
+        if type(posterior_layers) is not int or posterior_layers < 1:
+            raise ValueError("posterior_layers must be a positive integer")
+        if type(adapter_rank) is not int or adapter_rank < 0:
+            raise ValueError("adapter_rank must be a nonnegative integer")
+        self.inference_only = inference_only
+        self.posterior_layers = posterior_layers
+        self.adapter_rank = adapter_rank
+        self.finetune_mode = "full"
         self.spec_channels = spec_channels
         self.inter_channels = inter_channels
         self.hidden_channels = hidden_channels
@@ -434,7 +445,9 @@ class SynthesizerTrn(nn.Module):
             from vdecoder.hifigan.models import Generator
             self.dec = Generator(h=hps)
 
-        self.enc_q = Encoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
+        if not inference_only:
+            self.enc_q = Encoder(spec_channels, inter_channels, hidden_channels, 5, 1,
+                                 posterior_layers, gin_channels=gin_channels)
         if use_transformer_flow:
             self.flow = TransformerCouplingBlock(inter_channels, hidden_channels, filter_channels, n_heads, n_layers_trans_flow, 5, p_dropout, n_flow_layer,  gin_channels=gin_channels, share_parameter= flow_share_parameter)
         else:
@@ -452,6 +465,21 @@ class SynthesizerTrn(nn.Module):
             )
         self.emb_uv = nn.Embedding(2, hidden_channels)
         self.character_mix = False
+        # Allocate optional adapters last so disabled models keep legacy init order.
+        self.prior_adapter = VoiceAdapter(hidden_channels, gin_channels, adapter_rank) if adapter_rank else None
+        self.decoder_adapter = VoiceAdapter(inter_channels, gin_channels, adapter_rank) if adapter_rank else None
+
+    def train(self, mode=True):
+        if mode and getattr(self, "inference_only", False):
+            raise RuntimeError("This model omits the training posterior; use infer()")
+        super().train(mode)
+        if mode and getattr(self, "finetune_mode", "full") != "full":
+            # Frozen dropout is an unwanted moving target during voice adaptation.
+            # eval() does not disable autograd through these frozen modules.
+            for name, child in self.named_children():
+                if name not in ("prior_adapter", "decoder_adapter"):
+                    child.eval()
+        return self
 
     def EnableCharacterMix(self, n_speakers_map, device):
         self.speaker_map = torch.zeros((n_speakers_map, 1, 1, self.gin_channels)).to(device)
@@ -461,7 +489,10 @@ class SynthesizerTrn(nn.Module):
         self.character_mix = True
 
     def forward(self, c, f0, uv, spec, g=None, c_lengths=None, spec_lengths=None, vol = None):
+        if self.inference_only:
+            raise RuntimeError("This model omits the training posterior; use infer()")
         g = self.emb_g(g).transpose(1,2)
+        raw_volume = vol
 
         # vol proj
         vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
@@ -479,6 +510,8 @@ class SynthesizerTrn(nn.Module):
             lf0 = 0
             norm_lf0 = 0
             pred_lf0 = 0
+        if self.prior_adapter is not None:
+            x = self.prior_adapter(x, f0, g, uv=uv, volume=raw_volume, mask=x_mask)
         # encoder
         z_ptemp, m_p, logs_p, _ = self.enc_p(x, x_mask, f0=f0_to_coarse(f0))
         z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
@@ -487,6 +520,12 @@ class SynthesizerTrn(nn.Module):
         z_p = self.flow(z, spec_mask, g=g)
         z_slice, pitch_slice, ids_slice = commons.rand_slice_segments_with_pitch(z, f0, spec_lengths, self.segment_size)
 
+        # The same adapter operates on matching frames in train and inference.
+        if self.decoder_adapter is not None:
+            uv_slice = commons.slice_pitch_segments(uv, ids_slice, self.segment_size)
+            vol_slice = (commons.slice_pitch_segments(raw_volume, ids_slice, self.segment_size)
+                         if raw_volume is not None else None)
+            z_slice = self.decoder_adapter(z_slice, pitch_slice, g, uv=uv_slice, volume=vol_slice)
         # nsf decoder
         o = self.dec(z_slice, g=g, f0=pitch_slice)
 
@@ -495,6 +534,9 @@ class SynthesizerTrn(nn.Module):
     @torch.no_grad()
     def infer(self, c, f0, uv, g=None, noice_scale=0.35, seed=52468, predict_f0=False, vol = None):
 
+        if predict_f0 and not self.use_automatic_f0_prediction:
+            raise ValueError("Automatic F0 prediction was not included in this model")
+        raw_volume = vol
         if c.device == torch.device("cuda"):
             torch.cuda.manual_seed_all(seed)
         else:
@@ -503,7 +545,7 @@ class SynthesizerTrn(nn.Module):
         c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
 
         if self.character_mix and len(g) > 1:   # [N, S]  *  [S, B, 1, H]
-            g = g.reshape((g.shape[0], g.shape[1], 1, 1, 1))  # [N, S, B, 1, 1]
+            g = g.reshape((g.shape[0], g.shape[1], 1, 1, 1))  # [N, S, B, 1, H]
             g = g * self.speaker_map  # [N, S, B, 1, H]
             g = torch.sum(g, dim=1) # [N, 1, B, 1, H]
             g = g.transpose(0, -1).transpose(0, -2).squeeze(0) # [B, H, N]
@@ -526,8 +568,19 @@ class SynthesizerTrn(nn.Module):
             pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
             f0 = (700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)).squeeze(1)
         
+        if self.prior_adapter is not None:
+            x = self.prior_adapter(x, f0, g, uv=uv, volume=raw_volume, mask=x_mask)
         z_p, m_p, logs_p, c_mask = self.enc_p(x, x_mask, f0=f0_to_coarse(f0), noice_scale=noice_scale)
         z = self.flow(z_p, c_mask, g=g, reverse=True)
+        if self.decoder_adapter is not None:
+            z = self.decoder_adapter(z, f0, g, uv=uv, volume=raw_volume, mask=c_mask)
         o = self.dec(z * c_mask, g=g, f0=f0)
         return o,f0
 
+
+class SynthesizerInfer(SynthesizerTrn):
+    """Inference graph: never construct or load enc_q. Keep legacy key names."""
+    def __init__(self, *args, **kwargs):
+        kwargs["inference_only"] = True
+        super().__init__(*args, **kwargs)
+        self.eval()
