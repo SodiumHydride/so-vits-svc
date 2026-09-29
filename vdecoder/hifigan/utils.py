@@ -1,13 +1,14 @@
 import glob
 import os
 
-# matplotlib.use("Agg")
-import matplotlib.pylab as plt
 import torch
 from torch.nn.utils import weight_norm
 
 
 def plot_spectrogram(spectrogram):
+    # Plotting is optional; importing the waveform model must not import a GUI stack.
+    import matplotlib.pylab as plt
+
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(spectrogram, aspect="auto", origin="lower",
                    interpolation='none')
