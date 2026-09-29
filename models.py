@@ -71,6 +71,9 @@ class TransformerCouplingBlock(nn.Module):
         self.hidden_channels = hidden_channels
         self.kernel_size = kernel_size
         self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
         self.flows = nn.ModuleList()
 
         self.wn = attentions.FFT(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, isflow = True, gin_channels = self.gin_channels) if share_parameter else None
@@ -277,7 +280,7 @@ class SpeakerEncoder(torch.nn.Module):
 
         if mel_len > partial_frames:
             mel_slices = self.compute_partial_slices(mel_len, partial_frames, partial_hop)
-            mels = [mel[:, s] for s in mel_slices]
+            mels = list(mel[:, s] for s in mel_slices)
             mels.append(last_mel)
             mels = torch.stack(tuple(mels), 0).squeeze(1)
 
